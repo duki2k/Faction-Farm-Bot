@@ -1,14 +1,19 @@
 import os
 import sqlite3
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from datetime import datetime
+from datetime import datetime, timedelta
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1486268008266596443
 WELCOME_LOG_CHANNEL_ID = 1486268009550188556
 RANKING_CHANNEL_ID = 1486268011823366218
+
+ADD_ACAO_CHANNEL_ID = 1486645052653437059
+EVENTO_ACAO_CHANNEL_ID = 1486644323515895838
+
 DB_FILE = "faction.db"
 
 ADMIN_ROLES = [
@@ -32,6 +37,9 @@ def get_week_key():
     now = datetime.now()
     year, week, _ = now.isocalendar()
     return f"{year}-W{week}"
+
+def now_str():
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -59,6 +67,8 @@ def init_db():
             created_by_id INTEGER NOT NULL,
             created_by_name TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL,
             week_key TEXT NOT NULL
         )
     """)
@@ -91,7 +101,7 @@ def add_farm(membro: str, farm_tipo: str, qtd: float, admin_id: int, admin_name:
         qtd,
         admin_id,
         admin_name,
-        datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_str()
     ))
     conn.commit()
     conn.close()
@@ -114,13 +124,13 @@ def get_farm_breakdown(limit=10):
     conn.close()
     return rows
 
-def save_pvp_event(message_id: int, channel_id: int, title: str, description: str, created_by_id: int, created_by_name: str):
+def save_pvp_event(message_id: int, channel_id: int, title: str, description: str, created_by_id: int, created_by_name: str, expires_at: str):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR REPLACE INTO pvp_events
-        (message_id, channel_id, title, description, created_by_id, created_by_name, created_at, week_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (message_id, channel_id, title, description, created_by_id, created_by_name, created_at, expires_at, status, week_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         message_id,
         channel_id,
@@ -128,9 +138,34 @@ def save_pvp_event(message_id: int, channel_id: int, title: str, description: st
         description,
         created_by_id,
         created_by_name,
-        datetime.now().strftime("%d/%m/%Y %H:%M"),
+        now_str(),
+        expires_at,
+        "aberto",
         get_week_key()
     ))
+    conn.commit()
+    conn.close()
+
+def get_event_data(message_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT message_id, channel_id, title, description, created_by_id, created_by_name, created_at, expires_at, status, week_key
+        FROM pvp_events
+        WHERE message_id = ?
+    """, (message_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def set_event_status(message_id: int, status: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE pvp_events
+        SET status = ?
+        WHERE message_id = ?
+    """, (status, message_id))
     conn.commit()
     conn.close()
 
@@ -150,7 +185,7 @@ def upsert_confirmation(message_id: int, user_id: int, user_name: str, status: s
         user_id,
         user_name,
         status,
-        datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_str()
     ))
     conn.commit()
     conn.close()
@@ -209,13 +244,28 @@ def get_top_pvp(limit=10):
     conn.close()
     return rows
 
-def build_pvp_embed(message_id: int, title: str, description: str, creator_name: str):
+def is_event_open(message_id: int):
+    row = get_event_data(message_id)
+    if not row:
+        return False
+    return row[8] == "aberto"
+
+def build_pvp_embed(message_id: int, title: str, description: str, creator_name: str, expires_at: str, status: str):
     confirmados, recusados = get_event_lists(message_id)
+
+    color = 0xFF4444 if status == "aberto" else 0x555555
+    status_text = "🟢 Aberto" if status == "aberto" else "⛔ Encerrado"
 
     embed = discord.Embed(
         title=title,
         description=description,
-        color=0xFF4444
+        color=color
+    )
+
+    embed.add_field(
+        name=f"Status",
+        value=f"{status_text}\nExpira em: {expires_at}",
+        inline=False
     )
 
     embed.add_field(
@@ -232,7 +282,7 @@ def build_pvp_embed(message_id: int, title: str, description: str, creator_name:
 
     embed.add_field(
         name="Como responder",
-        value="Use os botões abaixo para confirmar, recusar ou remover sua resposta.",
+        value="Use os botões abaixo antes do prazo para confirmar, recusar ou remover sua resposta.",
         inline=False
     )
 
@@ -240,11 +290,18 @@ def build_pvp_embed(message_id: int, title: str, description: str, creator_name:
     return embed
 
 class PVPEventView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, disabled=False):
         super().__init__(timeout=None)
+        for item in self.children:
+            item.disabled = disabled
 
     @discord.ui.button(label="Participar", style=discord.ButtonStyle.success, custom_id="pvp_participar")
     async def participar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_event_open(interaction.message.id):
+            await interaction.response.send_message("⛔ Esta chamada já expirou.", ephemeral=True)
+            return
+
+        row = get_event_data(interaction.message.id)
         upsert_confirmation(
             message_id=interaction.message.id,
             user_id=interaction.user.id,
@@ -254,15 +311,21 @@ class PVPEventView(discord.ui.View):
 
         embed = build_pvp_embed(
             interaction.message.id,
-            interaction.message.embeds[0].title,
-            interaction.message.embeds[0].description,
-            interaction.message.embeds[0].footer.text.replace("Criado por ", "")
+            row[2],
+            row[3],
+            row[5],
+            row[7],
+            row[8]
         )
-
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=PVPEventView(disabled=False))
 
     @discord.ui.button(label="Não participar", style=discord.ButtonStyle.danger, custom_id="pvp_recusar")
     async def recusar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_event_open(interaction.message.id):
+            await interaction.response.send_message("⛔ Esta chamada já expirou.", ephemeral=True)
+            return
+
+        row = get_event_data(interaction.message.id)
         upsert_confirmation(
             message_id=interaction.message.id,
             user_id=interaction.user.id,
@@ -272,15 +335,21 @@ class PVPEventView(discord.ui.View):
 
         embed = build_pvp_embed(
             interaction.message.id,
-            interaction.message.embeds[0].title,
-            interaction.message.embeds[0].description,
-            interaction.message.embeds[0].footer.text.replace("Criado por ", "")
+            row[2],
+            row[3],
+            row[5],
+            row[7],
+            row[8]
         )
-
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=PVPEventView(disabled=False))
 
     @discord.ui.button(label="Remover minha resposta", style=discord.ButtonStyle.secondary, custom_id="pvp_remover")
     async def remover(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_event_open(interaction.message.id):
+            await interaction.response.send_message("⛔ Esta chamada já expirou.", ephemeral=True)
+            return
+
+        row = get_event_data(interaction.message.id)
         delete_confirmation(
             message_id=interaction.message.id,
             user_id=interaction.user.id
@@ -288,17 +357,45 @@ class PVPEventView(discord.ui.View):
 
         embed = build_pvp_embed(
             interaction.message.id,
-            interaction.message.embeds[0].title,
-            interaction.message.embeds[0].description,
-            interaction.message.embeds[0].footer.text.replace("Criado por ", "")
+            row[2],
+            row[3],
+            row[5],
+            row[7],
+            row[8]
         )
+        await interaction.response.edit_message(embed=embed, view=PVPEventView(disabled=False))
 
-        await interaction.response.edit_message(embed=embed, view=self)
+async def expire_event_later(message_id: int, channel_id: int, minutes: int):
+    await asyncio.sleep(minutes * 60)
+
+    row = get_event_data(message_id)
+    if not row or row[8] != "aberto":
+        return
+
+    set_event_status(message_id, "encerrado")
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return
+
+    try:
+        msg = await channel.fetch_message(message_id)
+        embed = build_pvp_embed(
+            message_id,
+            row[2],
+            row[3],
+            row[5],
+            row[7],
+            "encerrado"
+        )
+        await msg.edit(embed=embed, view=PVPEventView(disabled=True))
+    except:
+        pass
 
 @bot.event
 async def on_ready():
     init_db()
-    bot.add_view(PVPEventView())
+    bot.add_view(PVPEventView(disabled=False))
 
     try:
         synced = await bot.tree.sync(guild=guild_obj)
@@ -359,7 +456,7 @@ async def farm(interaction: discord.Interaction, membro: str, qtd: float, farm: 
     embed.add_field(name="Farm desejado", value=farm.value, inline=True)
     embed.add_field(name="Quantidade", value=f"{qtd} un", inline=True)
     embed.add_field(name="Adicionado por", value=interaction.user.mention, inline=False)
-    embed.set_footer(text=f"Registrado em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    embed.set_footer(text=f"Registrado em {now_str()}")
 
     await interaction.response.send_message(embed=embed)
 
@@ -429,26 +526,56 @@ async def fechamento(interaction: discord.Interaction):
     await ranking_channel.send(embed=embed)
     await interaction.response.send_message(f"✅ Fechamento publicado com sucesso em {ranking_channel.mention}.", ephemeral=True)
 
-@bot.tree.command(name="pvpevent", description="Criar evento PVP com confirmação por botões", guild=guild_obj)
-@app_commands.describe(titulo="Título do evento", mensagem="Descrição da ação PVP")
-async def pvpevent(interaction: discord.Interaction, titulo: str, mensagem: str):
+@bot.tree.command(name="pvpevent", description="Criar evento PVP com prazo e envio em canal separado", guild=guild_obj)
+@app_commands.describe(
+    titulo="Título da ação",
+    mensagem="Descrição da ação PVP",
+    duracao_minutos="Tempo de duração da chamada em minutos"
+)
+async def pvpevent(interaction: discord.Interaction, titulo: str, mensagem: str, duracao_minutos: int):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("❌ Apenas admins podem usar esse comando.", ephemeral=True)
         return
+
+    if interaction.channel_id != ADD_ACAO_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"❌ Este comando só pode ser usado no canal <#{ADD_ACAO_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
+    if duracao_minutos <= 0:
+        await interaction.response.send_message("❌ A duração deve ser maior que 0 minuto.", ephemeral=True)
+        return
+
+    event_channel = interaction.guild.get_channel(EVENTO_ACAO_CHANNEL_ID)
+    if event_channel is None:
+        await interaction.response.send_message(
+            "❌ Não encontrei o canal de evento ação configurado.",
+            ephemeral=True
+        )
+        return
+
+    expires_at_dt = datetime.now() + timedelta(minutes=duracao_minutos)
+    expires_at_str = expires_at_dt.strftime("%d/%m/%Y %H:%M")
 
     temp_embed = discord.Embed(
         title=f"⚔️ {titulo}",
         description=mensagem,
         color=0xFF4444
     )
+    temp_embed.add_field(name="Status", value=f"🟢 Aberto\nExpira em: {expires_at_str}", inline=False)
     temp_embed.add_field(name="✅ Confirmados (0)", value="Ninguém confirmou ainda.", inline=True)
     temp_embed.add_field(name="❌ Não vão (0)", value="Ninguém recusou ainda.", inline=True)
-    temp_embed.add_field(name="Como responder", value="Use os botões abaixo para confirmar, recusar ou remover sua resposta.", inline=False)
+    temp_embed.add_field(
+        name="Como responder",
+        value="Use os botões abaixo antes do prazo para confirmar, recusar ou remover sua resposta.",
+        inline=False
+    )
     temp_embed.set_footer(text=f"Criado por {interaction.user.display_name}")
 
-    view = PVPEventView()
-    await interaction.response.send_message(embed=temp_embed, view=view)
-    msg = await interaction.original_response()
+    view = PVPEventView(disabled=False)
+    msg = await event_channel.send(embed=temp_embed, view=view)
 
     save_pvp_event(
         message_id=msg.id,
@@ -456,7 +583,15 @@ async def pvpevent(interaction: discord.Interaction, titulo: str, mensagem: str)
         title=f"⚔️ {titulo}",
         description=mensagem,
         created_by_id=interaction.user.id,
-        created_by_name=interaction.user.display_name
+        created_by_name=interaction.user.display_name,
+        expires_at=expires_at_str
+    )
+
+    asyncio.create_task(expire_event_later(msg.id, msg.channel.id, duracao_minutos))
+
+    await interaction.response.send_message(
+        f"✅ Ação criada com sucesso em {event_channel.mention}.\n⏳ Expiração: {duracao_minutos} minuto(s).",
+        ephemeral=True
     )
 
 @bot.tree.command(name="removerpvp", description="Remover manualmente um membro da lista de um evento PVP", guild=guild_obj)
@@ -481,19 +616,23 @@ async def removerpvp(interaction: discord.Interaction, mensagem_id: str, membro:
         await interaction.response.send_message("❌ Não encontrei esse membro na lista desse evento.", ephemeral=True)
         return
 
-    channel = interaction.channel
-    try:
-        msg = await channel.fetch_message(message_id)
-        if msg.embeds:
-            embed = build_pvp_embed(
-                msg.id,
-                msg.embeds[0].title,
-                msg.embeds[0].description,
-                msg.embeds[0].footer.text.replace("Criado por ", "")
-            )
-            await msg.edit(embed=embed, view=PVPEventView())
-    except:
-        pass
+    row = get_event_data(message_id)
+    if row:
+        channel = bot.get_channel(row[1])
+        if channel:
+            try:
+                msg = await channel.fetch_message(message_id)
+                embed = build_pvp_embed(
+                    msg.id,
+                    row[2],
+                    row[3],
+                    row[5],
+                    row[7],
+                    row[8]
+                )
+                await msg.edit(embed=embed, view=PVPEventView(disabled=(row[8] != "aberto")))
+            except:
+                pass
 
     await interaction.response.send_message("✅ Membro removido da lista do evento com sucesso.", ephemeral=True)
 
@@ -511,7 +650,7 @@ async def toppvp(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="⚔️ Top PVP semanal",
-        description="Ranking privado com base nas confirmações de participação.",
+        description="Ranking privado com base nas confirmações registradas nas ações.",
         color=0x8E44AD
     )
 
@@ -552,7 +691,7 @@ async def tutorial(interaction: discord.Interaction):
     )
     embed.add_field(
         name="/pvpevent",
-        value="Cria um embed com botões para membros confirmarem ou recusarem presença.",
+        value=f"Cria uma ação apenas no canal <#{ADD_ACAO_CHANNEL_ID}> e publica o embed em <#{EVENTO_ACAO_CHANNEL_ID}> com prazo em minutos.",
         inline=False
     )
     embed.add_field(
